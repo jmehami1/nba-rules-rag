@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nba-rules-rag"
+version = "0.1.0"
+description = "NBA rules RAG MVP"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]

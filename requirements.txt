@@ -1,0 +1,11 @@
+numpy
+pandas
+pillow
+matplotlib
+pypdf
+sentence-transformers
+faiss-cpu
+pyyaml
+jupyter
+ipykernel
+opencv-python

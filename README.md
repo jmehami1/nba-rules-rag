@@ -42,5 +42,34 @@ Status legend: [x] implemented, [ ] in progress/next
 - `data/` - local artifacts
 - `tests/` - tests
 
+## Setup and run
+
+### Option A (recommended): Google Colab
+1. Open `notebooks/nba_rules_rag_colab.ipynb` in Colab.
+2. Install dependencies in the first cell:
+	```bash
+	!pip install -r requirements.txt
+	!pip install -e .
+	```
+3. Run all notebook cells in order.
+
+### Option B: Local smoke check (development)
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+Run the current pipeline stub:
+```bash
+python -c "from nba_rules_rag.pipeline import run_pipeline; print(run_pipeline('https://www.youtube.com/watch?v=abc123','00:41','00:45','Was this a travel?'))"
+```
+
+Expected result: a JSON-like dictionary with input fields and `status: pipeline stub created`.
+
+## Current run status
+- `scripts/build_rulebook_index.py` and `scripts/run_demo.py` are placeholders and will be wired as the next implementation steps.
+
 ## License
 MIT. See `LICENSE`.

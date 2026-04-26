@@ -1,6 +1,16 @@
 # NBA Video Rules RAG — YouTube Clip Officiating Analysis
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jmehami1/nba-rules-rag/blob/main/notebooks/nba_rules_rag_colab.ipynb)
+
 A multimodal RAG system that watches a short basketball clip, narrates it with a vision model, retrieves relevant NBA rulebook sections, and produces a structured officiating analysis with explicit rule citations and confidence levels.
+
+## Try it in Colab
+
+The fastest way to run the full pipeline is the interactive Colab notebook — no local setup required:
+
+**[Open `nba_rules_rag_colab.ipynb` in Colab](https://colab.research.google.com/github/jmehami1/nba-rules-rag/blob/main/notebooks/nba_rules_rag_colab.ipynb)**
+
+The notebook walks through every stage of the pipeline with clearly labelled sections, inline outputs, and a final ruling display. Run it top-to-bottom. Demo mode (`DEMO_MODE = True`) requires no API key.
 
 ## Pipeline
 
@@ -66,7 +76,7 @@ src/nba_rules_rag/
   rulebook_loader.py   # pypdf text extraction
   youtube_utils.py     # URL parsing, timestamp parsing, interval validation
 notebooks/
-  nba_rules_rag_colab.ipynb  # Colab walkthrough
+  nba_rules_rag_colab.ipynb  # end-to-end Colab walkthrough (demo + live modes)
 scripts/
   run_nba_query.py           # main CLI — frame extraction, VLM, RAG, ruling
 data/
@@ -223,7 +233,7 @@ pytest --run-api-tests tests/test_run_nba_query.py::test_api_calls_work -s -v
 - [x] Secure credential bootstrap: interactive prompts, `getpass`, `.env` + `chmod 600`
 - [x] Model selection menu (numbered list of known OpenAI models + custom entry)
 - [x] Cleanup pass: removed deprecated scripts/modules and stale tests
-- [ ] Colab notebook polish and end-to-end reproducibility improvements
+- [x] Colab notebook — full end-to-end walkthrough with demo and live modes, inline outputs, and structured final ruling display
 - [ ] Demo UI (Gradio or Streamlit)
 
 ## Future work

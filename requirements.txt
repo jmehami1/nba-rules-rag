@@ -1,11 +1,18 @@
+# Core dependencies for NBA Rules RAG
 numpy
-pandas
 pillow
 matplotlib
 pypdf
 sentence-transformers
 faiss-cpu
-pyyaml
+
+# For YouTube video processing (required for live mode, not needed for --demo)
+opencv-python
+yt-dlp
+
+# Testing
+pytest
+
+# Optional: for Jupyter notebook support
 jupyter
 ipykernel
-opencv-python

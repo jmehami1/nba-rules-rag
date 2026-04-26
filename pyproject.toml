@@ -5,8 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nba-rules-rag"
 version = "0.1.0"
-description = "NBA rules RAG MVP"
+description = "NBA video officiating analysis using VLM narration and rulebook RAG"
 requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pillow",
+    "matplotlib",
+    "pypdf",
+    "sentence-transformers",
+    "faiss-cpu",
+    "opencv-python",
+    "yt-dlp",
+]
+
+[project.scripts]
+run-nba-query = "scripts.run_nba_query:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+]
+testpaths = ["tests"]

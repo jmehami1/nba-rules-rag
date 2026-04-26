@@ -3,10 +3,10 @@ __pycache__/
 .ipynb_checkpoints/
 .env
 .venv/
-data/raw/*
-!data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+!data/processed/demo_frames/
+!data/processed/demo_frames/**
 data/vector_store/*
 !data/vector_store/.gitkeep
 outputs/

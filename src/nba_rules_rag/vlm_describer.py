@@ -15,6 +15,27 @@ DEFAULT_VLM_MODEL: str | None = None  # set via VLM_MODEL env var or pass explic
 DEFAULT_VLM_API_BASE = "https://api.openai.com/v1/chat/completions"
 
 
+def _is_openai_endpoint(api_base: str) -> bool:
+	"""Return True if the configured endpoint appears to be OpenAI-hosted."""
+	return "api.openai.com" in (api_base or "").lower()
+
+
+def _resolve_vlm_token(explicit_token: str | None, api_base: str) -> str | None:
+	"""Resolve API token based on endpoint.
+
+	For OpenAI-hosted endpoints, only OPENAI_API_KEY is accepted to avoid
+	accidentally sending an HF token to OpenAI.
+	"""
+	if explicit_token:
+		return explicit_token
+
+	openai_key = os.getenv("OPENAI_API_KEY")
+	if _is_openai_endpoint(api_base):
+		return openai_key
+
+	return openai_key or os.getenv("HF_TOKEN")
+
+
 _VLM_SYSTEM_PROMPT = (
 	"You are an expert NBA basketball analyst reviewing a sequence of video frames "
 	"to produce a factual, evidence-based narration that will be used to answer a "
@@ -101,22 +122,37 @@ def _extract_text_from_response(payload: dict) -> str:
 	if not choices:
 		raise RuntimeError("VLM response missing 'choices'.")
 
-	message = choices[0].get("message", {})
+	first_choice = choices[0]
+	message = first_choice.get("message", {})
 	content = message.get("content")
 
+	# Some OpenAI-compatible providers return plain text at choice level.
+	choice_text = first_choice.get("text")
+	if isinstance(choice_text, str) and choice_text.strip():
+		return choice_text.strip()
+
 	if isinstance(content, str):
-		return content.strip()
+		if content.strip():
+			return content.strip()
+		refusal = message.get("refusal")
+		if isinstance(refusal, str) and refusal.strip():
+			return refusal.strip()
+		return ""
 
 	if isinstance(content, list):
 		text_parts: list[str] = []
 		for part in content:
-			if isinstance(part, dict) and part.get("type") == "text":
+			if isinstance(part, dict) and part.get("type") in {"text", "output_text"}:
 				text = part.get("text", "")
 				if text:
 					text_parts.append(str(text).strip())
 		joined = "\n".join([p for p in text_parts if p])
 		if joined:
 			return joined
+		refusal = message.get("refusal")
+		if isinstance(refusal, str) and refusal.strip():
+			return refusal.strip()
+		return ""
 
 	raise RuntimeError("VLM response did not contain readable text content.")
 
@@ -145,36 +181,130 @@ def _extract_json_block(text: str) -> dict:
 	raise RuntimeError("VLM response did not include a JSON object.")
 
 
+def _fallback_structured_response(question: str, text: str) -> dict:
+	"""Build a minimal structured response when the model returns plain text.
+
+	This keeps the pipeline running even when a model ignores the JSON-only instruction.
+	"""
+	clean_text = (text or "").strip()
+	if not clean_text:
+		clean_text = "VLM returned empty content; no structured JSON could be parsed."
+
+	return {
+		"question": question,
+		"play_narration": clean_text,
+		"frame_observations": [],
+		"query_relevant_signals": [],
+		"uncertainties": [
+			"Model response was plain text instead of JSON; parsed using fallback wrapper.",
+		],
+		"parse_warning": "VLM response was not valid JSON; fallback wrapper applied.",
+	}
+
+
 def _post_chat_completion(payload: dict, token: str, timeout_sec: int) -> dict:
 	"""Post payload to OpenAI-compatible chat completion endpoint."""
 	api_base = os.getenv("VLM_API_BASE", DEFAULT_VLM_API_BASE)
-	body = json.dumps(payload).encode("utf-8")
 
-	request = Request(
-		api_base,
-		data=body,
-		headers={
-			"Authorization": f"Bearer {token}",
-			"Content-Type": "application/json",
-		},
-		method="POST",
-	)
+	def _do_post(request_payload: dict) -> dict:
+		body = json.dumps(request_payload).encode("utf-8")
+		request = Request(
+			api_base,
+			data=body,
+			headers={
+				"Authorization": f"Bearer {token}",
+				"Content-Type": "application/json",
+			},
+			method="POST",
+		)
+
+		try:
+			with urlopen(request, timeout=timeout_sec) as response:  # noqa: S310
+				response_body = response.read().decode("utf-8")
+		except HTTPError as exc:
+			details = exc.read().decode("utf-8", errors="replace")
+			raise RuntimeError(
+				f"VLM request failed with HTTP {exc.code}: {details}"
+			) from exc
+		except URLError as exc:
+			raise RuntimeError(f"VLM request failed: {exc.reason}") from exc
+
+		try:
+			return json.loads(response_body)
+		except json.JSONDecodeError as exc:
+			raise RuntimeError("VLM response was not valid JSON.") from exc
 
 	try:
-		with urlopen(request, timeout=timeout_sec) as response:  # noqa: S310
-			response_body = response.read().decode("utf-8")
-	except HTTPError as exc:
-		details = exc.read().decode("utf-8", errors="replace")
-		raise RuntimeError(
-			f"VLM request failed with HTTP {exc.code}: {details}"
-		) from exc
-	except URLError as exc:
-		raise RuntimeError(f"VLM request failed: {exc.reason}") from exc
+		return _do_post(payload)
+	except RuntimeError as exc:
+		err = str(exc).lower()
 
-	try:
-		return json.loads(response_body)
-	except json.JSONDecodeError as exc:
-		raise RuntimeError("VLM response was not valid JSON.") from exc
+		# Some models reject reasoning_effort="none"; try "low" first.
+		if (
+			"reasoning_effort" in err
+			and "unsupported" in err
+			and payload.get("reasoning_effort") == "none"
+		):
+			retry_payload = {**payload, "reasoning_effort": "low"}
+			return _do_post(retry_payload)
+
+		# If reasoning_effort itself is unsupported, remove it.
+		if (
+			"reasoning_effort" in err
+			and "unsupported" in err
+			and "reasoning_effort" in payload
+		):
+			retry_payload = {**payload}
+			retry_payload.pop("reasoning_effort", None)
+			return _do_post(retry_payload)
+
+		# Some providers do not support response_format.
+		if (
+			"unsupported_parameter" in err
+			and "response_format" in err
+			and "response_format" in payload
+		):
+			retry_payload = {**payload}
+			retry_payload.pop("response_format", None)
+			return _do_post(retry_payload)
+
+		# Some models reject max_completion_tokens and require max_tokens.
+		if (
+			"unsupported_parameter" in err
+			and "max_completion_tokens" in err
+			and "max_completion_tokens" in payload
+		):
+			retry_payload = {
+				**payload,
+				"max_tokens": payload["max_completion_tokens"],
+			}
+			retry_payload.pop("max_completion_tokens", None)
+			return _do_post(retry_payload)
+
+		# If max_completion_tokens is unsupported and max_tokens fallback fails,
+		# try once without explicit completion token caps.
+		if (
+			"unsupported_parameter" in err
+			and "max_completion_tokens" in err
+			and "max_completion_tokens" in payload
+		):
+			retry_payload = {**payload}
+			retry_payload.pop("max_completion_tokens", None)
+			return _do_post(retry_payload)
+
+		# Some models reject max_tokens and require max_completion_tokens.
+		if (
+			"unsupported_parameter" in err
+			and "max_tokens" in err
+			and "max_tokens" in payload
+		):
+			retry_payload = {
+				**payload,
+				"max_completion_tokens": payload["max_tokens"],
+			}
+			retry_payload.pop("max_tokens", None)
+			return _do_post(retry_payload)
+		raise
 
 
 def describe_frames_with_vlm(
@@ -200,17 +330,29 @@ def describe_frames_with_vlm(
 	if not clean_question:
 		raise ValueError("question must be a non-empty string")
 
-	resolved_token = token or os.getenv("OPENAI_API_KEY") or os.getenv("HF_TOKEN")
+	api_base = os.getenv("VLM_API_BASE", DEFAULT_VLM_API_BASE)
+	resolved_token = _resolve_vlm_token(token, api_base)
 	if not resolved_token:
-		raise RuntimeError(
-			"Missing API token. Set OPENAI_API_KEY or HF_TOKEN env var, or pass token explicitly."
-		)
+		if _is_openai_endpoint(api_base):
+			raise RuntimeError("Missing API token. Set OPENAI_API_KEY env var, or pass token explicitly.")
+		raise RuntimeError("Missing API token. Set OPENAI_API_KEY or HF_TOKEN env var, or pass token explicitly.")
 
 	resolved_model = model or os.getenv("VLM_MODEL")
 	if not resolved_model:
 		raise ValueError(
 			"No VLM model specified. Set VLM_MODEL env var or pass model explicitly."
 		)
+
+	reasoning_effort = (os.getenv("VLM_REASONING_EFFORT", "none") or "none").strip()
+	max_completion_tokens_raw = (os.getenv("VLM_MAX_COMPLETION_TOKENS", "2048") or "2048").strip()
+	try:
+		max_completion_tokens = int(max_completion_tokens_raw)
+	except ValueError as exc:
+		raise ValueError(
+			f"Invalid VLM_MAX_COMPLETION_TOKENS value: {max_completion_tokens_raw!r}. Expected integer."
+		) from exc
+	if max_completion_tokens <= 0:
+		raise ValueError("VLM_MAX_COMPLETION_TOKENS must be a positive integer.")
 
 	user_text = build_vlm_user_prompt(clean_question, frame_timestamps_sec)
 
@@ -241,17 +383,23 @@ def describe_frames_with_vlm(
 				"content": user_content,
 			},
 		],
-		"temperature": 0.1,
-		"max_tokens": 1500,
+		"response_format": {"type": "json_object"},
+		"reasoning_effort": reasoning_effort,
+		"max_completion_tokens": max_completion_tokens,
 	}
 
 	response_json = _post_chat_completion(payload, resolved_token, timeout_sec)
 	text = _extract_text_from_response(response_json)
-	structured = _extract_json_block(text)
+	try:
+		structured = _extract_json_block(text)
+	except RuntimeError:
+		structured = _fallback_structured_response(clean_question, text)
 
 	return {
 		"n_frames": len(frames),
 		"frame_timestamps_sec": frame_timestamps_sec,
+		"_raw_vlm_response_text": text,
+		"_raw_vlm_response_json": response_json,
 		**structured,
 	}
 

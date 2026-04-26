@@ -25,7 +25,12 @@ run-nba-query = "scripts.run_nba_query:main"
 where = ["src"]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
+filterwarnings = [
+    "ignore::DeprecationWarning:importlib",
+]
 markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "api: marks tests that make real API calls (skipped by default; use --run-api-tests to run)",
 ]
 testpaths = ["tests"]

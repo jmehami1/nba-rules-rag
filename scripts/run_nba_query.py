@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
+import getpass
 import json
 import logging
 import math
 import os
 import sys
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -40,6 +44,34 @@ DEFAULT_END_TIME = "0:29"
 DEFAULT_QUESTION = "Was this player in blue uniform travelling?"
 DEFAULT_RULEBOOK_PDF_PATH = str(REPO_ROOT / "docs" / "2023-24-NBA-Season-Official-Playing-Rules.pdf")
 DEFAULT_VECTOR_STORE_DIR = str(REPO_ROOT / "data" / "vector_store")
+DEFAULT_PROCESSED_DIR = REPO_ROOT / "data" / "processed"
+DEFAULT_DEMO_FRAMES_DIR = DEFAULT_PROCESSED_DIR / "demo_frames"
+DEFAULT_REASONER_API_BASE = "https://api.openai.com/v1/chat/completions"
+DEFAULT_ENV_PATH = REPO_ROOT / ".env"
+REQUIRED_LIVE_ENV_VARS = ("OPENAI_API_KEY", "VLM_MODEL", "REASONER_MODEL")
+OPENAI_MODEL_OPTIONS = (
+	"gpt-5.5",
+	"gpt-5.4",
+	"gpt-5.4-mini",
+	"gpt-5.4-nano",
+)
+
+
+def _is_openai_endpoint(api_base: str) -> bool:
+	"""Return True if the configured endpoint appears to be OpenAI-hosted."""
+	return "api.openai.com" in (api_base or "").lower()
+
+
+def _resolve_token_for_endpoint(api_base: str) -> str | None:
+	"""Resolve auth token based on endpoint host.
+
+	For OpenAI-hosted endpoints, only OPENAI_API_KEY is used to avoid
+	accidentally passing an HF token to OpenAI.
+	"""
+	openai_key = os.getenv("OPENAI_API_KEY")
+	if _is_openai_endpoint(api_base):
+		return openai_key
+	return openai_key or os.getenv("HF_TOKEN")
 
 DEMO_RULING = {
 	"question": "Was this player in blue uniform travelling?",
@@ -96,6 +128,137 @@ DEMO_RULING = {
 		"Because the required post-gather footfall sequence is ambiguous, a definitive travel ruling cannot be made from the provided frames.",
 	],
 }
+
+
+def _load_env_file(env_path: Path = DEFAULT_ENV_PATH) -> None:
+	"""Load KEY=VALUE pairs from .env without overwriting existing process env."""
+	if not env_path.exists():
+		return
+
+	for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+		line = raw_line.strip()
+		if not line or line.startswith("#") or "=" not in line:
+			continue
+		key, value = line.split("=", 1)
+		key = key.strip()
+		value = value.strip().strip('"').strip("'")
+		if key and value and not os.getenv(key):
+			os.environ[key] = value
+
+
+def _upsert_env_file(updates: dict[str, str], env_path: Path = DEFAULT_ENV_PATH) -> None:
+	"""Update or append env vars in .env and lock down file permissions."""
+	lines: list[str] = []
+	if env_path.exists():
+		lines = env_path.read_text(encoding="utf-8").splitlines()
+
+	remaining = dict(updates)
+	new_lines: list[str] = []
+	for line in lines:
+		stripped = line.strip()
+		if not stripped or stripped.startswith("#") or "=" not in stripped:
+			new_lines.append(line)
+			continue
+		key = stripped.split("=", 1)[0].strip()
+		if key in remaining:
+			new_lines.append(f"{key}={remaining.pop(key)}")
+		else:
+			new_lines.append(line)
+
+	for key, value in remaining.items():
+		new_lines.append(f"{key}={value}")
+
+	content = "\n".join(new_lines).rstrip() + "\n"
+	env_path.write_text(content, encoding="utf-8")
+	os.chmod(env_path, 0o600)
+
+
+def _prompt_model_choice(var_name: str) -> str:
+	"""Prompt user to choose a model from known OpenAI options or enter a custom ID."""
+	print(
+		f"Select {var_name} from OpenAI model options (source: https://developers.openai.com/api/docs/models):",
+		file=sys.stderr,
+	)
+	for idx, model_name in enumerate(OPENAI_MODEL_OPTIONS, start=1):
+		print(f"  {idx}. {model_name}", file=sys.stderr)
+	print(f"  {len(OPENAI_MODEL_OPTIONS) + 1}. Enter custom model ID", file=sys.stderr)
+
+	selection = input(f"Enter selection for {var_name} [1-{len(OPENAI_MODEL_OPTIONS) + 1}]: ").strip()
+	if not selection:
+		raise RuntimeError(
+			f"{var_name} was not provided. Aborting live run to avoid insecure/misconfigured execution."
+		)
+
+	try:
+		choice = int(selection)
+	except ValueError as exc:
+		raise RuntimeError(f"Invalid selection for {var_name}: {selection}") from exc
+
+	if 1 <= choice <= len(OPENAI_MODEL_OPTIONS):
+		return OPENAI_MODEL_OPTIONS[choice - 1]
+	if choice == len(OPENAI_MODEL_OPTIONS) + 1:
+		custom = input(f"Enter custom model ID for {var_name}: ").strip()
+		if not custom:
+			raise RuntimeError(
+				f"{var_name} custom model ID was not provided. Aborting live run."
+			)
+		return custom
+
+	raise RuntimeError(
+		f"Invalid selection for {var_name}: {selection}. Expected 1-{len(OPENAI_MODEL_OPTIONS) + 1}."
+	)
+
+
+def ensure_non_demo_env_configured() -> None:
+	"""Prompt for missing live-mode credentials, persist to .env, and enforce presence."""
+	_load_env_file()
+
+	missing = [name for name in REQUIRED_LIVE_ENV_VARS if not os.getenv(name)]
+	if not missing:
+		return
+
+	if not sys.stdin.isatty():
+		raise RuntimeError(
+			"Missing required environment variables for live mode: "
+			+ ", ".join(missing)
+			+ ". Set them in your shell or .env and retry."
+		)
+
+	print("Missing required live-mode credentials/config. They will be saved to .env and never printed.", file=sys.stderr)
+	updates: dict[str, str] = {}
+	for name in missing:
+		if name == "OPENAI_API_KEY":
+			value = getpass.getpass(f"Enter {name}: ").strip()
+		elif name in {"VLM_MODEL", "REASONER_MODEL"}:
+			value = _prompt_model_choice(name)
+		else:
+			value = input(f"Enter {name}: ").strip()
+
+		if not value:
+			raise RuntimeError(
+				f"{name} was not provided. Aborting live run to avoid insecure/misconfigured execution."
+			)
+
+		updates[name] = value
+		os.environ[name] = value
+
+	_upsert_env_file(updates)
+	print(f"Saved {', '.join(updates.keys())} to {DEFAULT_ENV_PATH} (mode 600).", file=sys.stderr)
+
+
+def confirm_live_api_charge_warning() -> bool:
+	"""Prompt once before paid API calls in non-demo mode."""
+	if not sys.stdin.isatty():
+		raise RuntimeError(
+			"Live API calls require interactive confirmation. Re-run in a terminal and confirm the charge warning."
+		)
+
+	print(
+		"Warning: this run will call external LLM/VLM APIs using your API key and may charge your account.",
+		file=sys.stderr,
+	)
+	answer = input("Continue with paid API calls? [y/N]: ").strip().lower()
+	return answer in {"y", "yes"}
 
 
 def ensure_rulebook_embeddings(
@@ -297,6 +460,247 @@ def estimate_frame_timestamps(start_sec: float, end_sec: float, n_frames: int) -
 	return [start_sec + i * step for i in range(n_frames)]
 
 
+def build_reasoning_prompt(vlm_result: dict | None, rag_chunks: list[dict] | None) -> str:
+	"""Build prompt text used for both copy-paste and automated reasoning."""
+	lines: list[str] = []
+
+	lines.append("You are an expert NBA rules official. Use only the provided play description and rulebook excerpts.")
+	lines.append("Do not infer unseen foot contacts between frames.")
+	lines.append("If the evidence is insufficient to establish a violation, say the play is inconclusive rather than guessing.")
+	lines.append("")
+
+	lines.append("Question: Was there enough visible evidence to rule this a travelling violation under the NBA rules?")
+	lines.append("")
+
+	lines.append("Decision standard:")
+	lines.append("- A travelling violation should only be called if the visible evidence clearly establishes the gather point and an illegal foot movement after the gather.")
+	lines.append("- If the gather point, pivot foot, or post-gather foot contacts are ambiguous, do not call a violation.")
+	lines.append("- Distinguish between:")
+	lines.append('  1. "No travel observed"')
+	lines.append('  2. "Travel observed"')
+	lines.append('  3. "Inconclusive / cannot determine from provided frames"')
+	lines.append("")
+
+	lines.append("Required analysis:")
+	lines.append("1. Identify the most likely gather frame and explain why using Rule 4, Section III.")
+	lines.append("2. Identify whether the player is progressing or stationary at gather.")
+	lines.append("3. Identify the first and second step after gather under Rule 8, Section XIII(b), if visible.")
+	lines.append("4. Identify whether a pivot foot is established, and whether it is lifted and returned.")
+	lines.append("5. Identify whether the player jumps and lands with the ball.")
+	lines.append("6. State whether the evidence clearly supports a travelling violation.")
+	lines.append("")
+
+	if vlm_result:
+		lines.append("--- Play Description ---")
+		if vlm_result.get("play_narration"):
+			lines.append(vlm_result["play_narration"])
+		if vlm_result.get("query_relevant_signals"):
+			lines.append("")
+			lines.append("Key signals observed:")
+			for sig in vlm_result["query_relevant_signals"]:
+				lines.append(f"- {sig}")
+		if vlm_result.get("uncertainties"):
+			lines.append("")
+			lines.append("Uncertainties:")
+			for unc in vlm_result["uncertainties"]:
+				lines.append(f"- {unc}")
+		lines.append("")
+
+	if rag_chunks:
+		lines.append("--- Relevant Rulebook Excerpts ---")
+		for i, chunk in enumerate(rag_chunks, start=1):
+			lines.append(f"[Excerpt {i} — {chunk.get('section_title', 'N/A')}]")
+			lines.append(chunk["text"])
+			lines.append("")
+
+	lines.append("Return JSON only:")
+	lines.append(json.dumps({
+		"question": "Was this player in blue uniform travelling?",
+		"applicable_rules": [
+			{"rule": "Rule 4, Section III(b)", "application": "How the gather rule applies to the visible facts."},
+			{"rule": "Rule 8, Section XIII(b)", "application": "How the two-step and pivot-foot rules apply to the visible facts."},
+		],
+		"likely_gather_frame": "F01|F02|F03|F04|F05|F06|F07|unclear",
+		"gather_confidence": "low|medium|high",
+		"post_gather_step_count_visible": "0|1|2|more_than_2|unclear",
+		"pivot_foot": "left|right|either|none|unclear",
+		"travel_ruling": "travel|no_travel|inconclusive",
+		"ruling_confidence": "low|medium|high",
+		"reasoning": "Short explanation focused on gather, steps, and pivot foot.",
+		"facts_required_for_travel_call": ["Specific missing or required fact."],
+		"limitations": ["Specific ambiguity caused by sampled frames, occlusion, or missing video."],
+	}, indent=2))
+
+	return "\n".join(lines)
+
+
+def _extract_reasoner_text(payload: dict) -> str:
+	"""Extract text content from OpenAI-compatible response payload."""
+	choices = payload.get("choices")
+	if not choices:
+		raise RuntimeError("Reasoner response missing 'choices'.")
+
+	message = choices[0].get("message", {})
+	content = message.get("content")
+	if isinstance(content, str):
+		return content.strip()
+
+	if isinstance(content, list):
+		parts: list[str] = []
+		for part in content:
+			if isinstance(part, dict) and part.get("type") == "text":
+				text = part.get("text", "")
+				if text:
+					parts.append(str(text).strip())
+		joined = "\n".join([p for p in parts if p])
+		if joined:
+			return joined
+
+	raise RuntimeError("Reasoner response did not contain readable text content.")
+
+
+def _extract_json_object(text: str) -> dict:
+	"""Extract first JSON object from a model text response."""
+	stripped = text.strip()
+	try:
+		parsed = json.loads(stripped)
+		if isinstance(parsed, dict):
+			return parsed
+	except json.JSONDecodeError:
+		pass
+
+	start = stripped.find("{")
+	end = stripped.rfind("}")
+	if start != -1 and end != -1 and end > start:
+		candidate = stripped[start : end + 1]
+		try:
+			parsed = json.loads(candidate)
+		except json.JSONDecodeError as exc:
+			raise RuntimeError("Reasoner output did not include valid JSON.") from exc
+		if isinstance(parsed, dict):
+			return parsed
+
+	raise RuntimeError("Reasoner output did not include a JSON object.")
+
+
+def request_reasoning_ruling(
+	question: str,
+	vlm_result: dict | None,
+	rag_chunks: list[dict] | None,
+	timeout_sec: int = 60,
+) -> dict:
+	"""Request a structured ruling from an OpenAI-compatible reasoner endpoint."""
+	api_base = os.getenv("REASONER_API_BASE", DEFAULT_REASONER_API_BASE)
+	resolved_token = _resolve_token_for_endpoint(api_base)
+	if not resolved_token:
+		if _is_openai_endpoint(api_base):
+			raise RuntimeError("Missing API token. Set OPENAI_API_KEY for non-demo automated reasoning.")
+		raise RuntimeError("Missing API token. Set OPENAI_API_KEY or HF_TOKEN for non-demo automated reasoning.")
+
+	resolved_model = os.getenv("REASONER_MODEL") or os.getenv("VLM_MODEL")
+	if not resolved_model:
+		raise ValueError("No reasoner model specified. Set REASONER_MODEL (or VLM_MODEL) for non-demo automated reasoning.")
+
+	user_prompt = build_reasoning_prompt(vlm_result, rag_chunks)
+	payload = {
+		"model": resolved_model,
+		"messages": [
+			{
+				"role": "system",
+				"content": "You are an expert NBA rules official. Return strict JSON only.",
+			},
+			{
+				"role": "user",
+				"content": user_prompt,
+			},
+		],
+		"temperature": 0.1,
+		"max_completion_tokens": 1500,
+	}
+
+	try:
+		payload_json = _post_chat_completion(api_base, resolved_token, payload, timeout_sec)
+	except RuntimeError:
+		raise
+
+	text = _extract_reasoner_text(payload_json)
+	ruling = _extract_json_object(text)
+	if "question" not in ruling:
+		ruling["question"] = question
+	return ruling
+
+
+def _post_chat_completion(
+	api_base: str,
+	token: str,
+	payload: dict,
+	timeout_sec: int,
+) -> dict:
+	"""POST to an OpenAI-compatible chat completion endpoint.
+
+	Automatically retries with ``max_completion_tokens`` when the API rejects
+	``max_tokens`` with HTTP 400 (newer models require the renamed parameter).
+	"""
+	def _do_post(p: dict) -> dict:
+		body = json.dumps(p).encode("utf-8")
+		req = Request(
+			api_base,
+			data=body,
+			headers={
+				"Authorization": f"Bearer {token}",
+				"Content-Type": "application/json",
+			},
+			method="POST",
+		)
+		try:
+			with urlopen(req, timeout=timeout_sec) as response:  # noqa: S310
+				return json.loads(response.read().decode("utf-8"))
+		except HTTPError as exc:
+			details = exc.read().decode("utf-8", errors="replace")
+			raise RuntimeError(f"Request failed with HTTP {exc.code}: {details}") from exc
+		except URLError as exc:
+			raise RuntimeError(f"Request failed: {exc.reason}") from exc
+
+	try:
+		return _do_post(payload)
+	except RuntimeError as exc:
+		err = str(exc).lower()
+
+		# Retry once with max_tokens if the API rejected max_completion_tokens
+		if "max_completion_tokens" in err and "unsupported_parameter" in err and "max_completion_tokens" in payload:
+			retried = {**payload, "max_tokens": payload["max_completion_tokens"]}
+			retried.pop("max_completion_tokens", None)
+			try:
+				return _do_post(retried)
+			except RuntimeError as retry_exc:
+				retry_err = str(retry_exc).lower()
+				if "temperature" in retry_err and "unsupported_value" in retry_err and "temperature" in retried:
+					retried_no_temp = {**retried}
+					retried_no_temp.pop("temperature", None)
+					return _do_post(retried_no_temp)
+				raise
+
+		# Retry once with max_completion_tokens if the API rejected max_tokens
+		if "max_tokens" in err and "unsupported_parameter" in err and "max_tokens" in payload:
+			retried = {**payload, "max_completion_tokens": payload["max_tokens"]}
+			retried.pop("max_tokens", None)
+			try:
+				return _do_post(retried)
+			except RuntimeError as retry_exc:
+				retry_err = str(retry_exc).lower()
+				if "temperature" in retry_err and "unsupported_value" in retry_err and "temperature" in retried:
+					retried_no_temp = {**retried}
+					retried_no_temp.pop("temperature", None)
+					return _do_post(retried_no_temp)
+				raise
+
+		if "temperature" in err and "unsupported_value" in err and "temperature" in payload:
+			retried_no_temp = {**payload}
+			retried_no_temp.pop("temperature", None)
+			return _do_post(retried_no_temp)
+		raise
+
+
 def build_parser() -> argparse.ArgumentParser:
 	"""Build CLI argument parser with stable development defaults."""
 	parser = argparse.ArgumentParser(
@@ -330,7 +734,7 @@ def build_parser() -> argparse.ArgumentParser:
 	)
 	parser.add_argument(
 		"--output-dir",
-		default=str(REPO_ROOT / "data" / "processed" / "demo_frames"),
+		default=str(DEFAULT_PROCESSED_DIR),
 		help="Directory where extracted frames and preview grid are saved.",
 	)
 	parser.add_argument(
@@ -403,6 +807,23 @@ def load_demo_frames(output_dir: Path) -> list:
 	return [Image.open(p) for p in paths]
 
 
+def build_run_output_dir(base_output_dir: Path, demo: bool) -> Path:
+	"""Return output directory for this run.
+
+	Demo runs reuse the provided directory, except when the processed root is
+	used (default) where demo assets live in data/processed/demo_frames.
+	Non-demo runs create a timestamped subdirectory so each run's extracted
+	frames are isolated.
+	"""
+	if demo:
+		if base_output_dir == DEFAULT_PROCESSED_DIR:
+			return DEFAULT_DEMO_FRAMES_DIR
+		return base_output_dir
+
+	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+	return base_output_dir / timestamp
+
+
 def run_nba_query(args: argparse.Namespace) -> dict:
 	"""Run validated frame extraction and optional demo-mode narration."""
 	rulebook_store_status = ensure_rulebook_embeddings(
@@ -418,8 +839,14 @@ def run_nba_query(args: argparse.Namespace) -> dict:
 	video_id = parse_youtube_url(youtube_url)
 	start_sec, end_sec = validate_interval(start_time, end_time)
 	cleaned_question = validate_question(question)
+	api_call_authorized = True
+	if not args.demo:
+		ensure_non_demo_env_configured()
+		api_call_authorized = confirm_live_api_charge_warning()
 
-	output_dir = Path(args.output_dir)
+	base_output_dir = Path(args.output_dir)
+	base_output_dir.mkdir(parents=True, exist_ok=True)
+	output_dir = build_run_output_dir(base_output_dir, demo=args.demo)
 	output_dir.mkdir(parents=True, exist_ok=True)
 
 	# In demo mode, load saved frames from disk; otherwise extract from YouTube
@@ -446,6 +873,8 @@ def run_nba_query(args: argparse.Namespace) -> dict:
 	vlm_embedding_error = None
 	if args.demo:
 		vlm_result = build_mock_vlm_result(cleaned_question, len(frames))
+	elif not api_call_authorized:
+		vlm_error = "Skipped because user declined live API call confirmation."
 	else:
 		try:
 			vlm_result = describe_frames_with_vlm(
@@ -474,10 +903,25 @@ def run_nba_query(args: argparse.Namespace) -> dict:
 	except (ValueError, RuntimeError, FileNotFoundError) as exc:
 		rag_error = str(exc)
 
+	ruling: dict | None = DEMO_RULING if args.demo else None
+	ruling_error: str | None = None
+	if not args.demo:
+		if not api_call_authorized:
+			ruling_error = "Skipped because user declined live API call confirmation."
+		else:
+			try:
+				ruling = request_reasoning_ruling(
+					question=cleaned_question,
+					vlm_result=vlm_result,
+					rag_chunks=rag_chunks,
+				)
+			except (ValueError, RuntimeError, Exception) as exc:
+				ruling_error = str(exc)
+
 	if not args.no_show:
 		plt.figure(figsize=(12, 8))
 		plt.imshow(plt.imread(grid_path))
-		plt.title("Extracted Keyframes")
+		plt.title("Extracted Keyframes (CLOSE to continue)")
 		plt.axis("off")
 		plt.show()
 
@@ -489,6 +933,7 @@ def run_nba_query(args: argparse.Namespace) -> dict:
 		"start_sec": start_sec,
 		"end_sec": end_sec,
 		"question": cleaned_question,
+		"api_call_authorized": api_call_authorized,
 		"n_frames": len(frames),
 		"frame_timestamps_sec": frame_timestamps_sec,
 		"output_dir": str(output_dir),
@@ -502,7 +947,8 @@ def run_nba_query(args: argparse.Namespace) -> dict:
 		"rag_query": rag_query,
 		"rag_chunks": rag_chunks,
 		"rag_error": rag_error,
-		"ruling": DEMO_RULING if args.demo else None,
+		"ruling": ruling,
+		"ruling_error": ruling_error,
 	}
 	return result
 
@@ -570,7 +1016,27 @@ def main() -> int:
 	print(" VLM OUTPUT")
 	print(sep)
 	if result.get("vlm_result") is not None:
-		print(json.dumps(result["vlm_result"], indent=2))
+		vlm_result = result["vlm_result"]
+		raw_text = vlm_result.get("_raw_vlm_response_text")
+		raw_json = vlm_result.get("_raw_vlm_response_json")
+		print(thin)
+		print(" Raw VLM Response")
+		print(thin)
+		if raw_text is not None:
+			print(raw_text)
+		elif raw_json is not None:
+			print(json.dumps(raw_json, indent=2))
+		else:
+			print("  (raw response unavailable)")
+
+		parsed_vlm_result = {
+			k: v for k, v in vlm_result.items() if k not in {"_raw_vlm_response_text", "_raw_vlm_response_json"}
+		}
+		print()
+		print(thin)
+		print(" Parsed VLM Output")
+		print(thin)
+		print(json.dumps(parsed_vlm_result, indent=2))
 		if result.get("vlm_embedding") is not None:
 			print()
 			print(thin)
@@ -580,7 +1046,8 @@ def main() -> int:
 		if result.get("vlm_embedding_error"):
 			print(f"  Embedding error: {result['vlm_embedding_error']}")
 	elif result.get("vlm_error"):
-		print(f"  Error: {result['vlm_error']}")
+		print(f"  [FAILED] {result['vlm_error']}")
+		print("  Reasoning will be attempted using RAG context only (no VLM narration).")
 	else:
 		print("  (no VLM result)")
 
@@ -590,84 +1057,7 @@ def main() -> int:
 	print(" COPY-PASTE PROMPT  (paste directly into OpenAI)")
 	print(sep)
 
-	lines: list[str] = []
-
-	# System instruction
-	lines.append("You are an expert NBA rules official. Use only the provided play description and rulebook excerpts.")
-	lines.append("Do not infer unseen foot contacts between frames.")
-	lines.append("If the evidence is insufficient to establish a violation, say the play is inconclusive rather than guessing.")
-	lines.append("")
-
-	# Question
-	lines.append("Question: Was there enough visible evidence to rule this a travelling violation under the NBA rules?")
-	lines.append("")
-
-	# Decision standard
-	lines.append("Decision standard:")
-	lines.append("- A travelling violation should only be called if the visible evidence clearly establishes the gather point and an illegal foot movement after the gather.")
-	lines.append("- If the gather point, pivot foot, or post-gather foot contacts are ambiguous, do not call a violation.")
-	lines.append("- Distinguish between:")
-	lines.append('  1. "No travel observed"')
-	lines.append('  2. "Travel observed"')
-	lines.append('  3. "Inconclusive / cannot determine from provided frames"')
-	lines.append("")
-
-	# Required analysis
-	lines.append("Required analysis:")
-	lines.append("1. Identify the most likely gather frame and explain why using Rule 4, Section III.")
-	lines.append("2. Identify whether the player is progressing or stationary at gather.")
-	lines.append("3. Identify the first and second step after gather under Rule 8, Section XIII(b), if visible.")
-	lines.append("4. Identify whether a pivot foot is established, and whether it is lifted and returned.")
-	lines.append("5. Identify whether the player jumps and lands with the ball.")
-	lines.append("6. State whether the evidence clearly supports a travelling violation.")
-	lines.append("")
-
-	# Play description from VLM
-	if result.get("vlm_result"):
-		lines.append("--- Play Description ---")
-		vlm = result["vlm_result"]
-		if vlm.get("play_narration"):
-			lines.append(vlm["play_narration"])
-		if vlm.get("query_relevant_signals"):
-			lines.append("")
-			lines.append("Key signals observed:")
-			for sig in vlm["query_relevant_signals"]:
-				lines.append(f"- {sig}")
-		if vlm.get("uncertainties"):
-			lines.append("")
-			lines.append("Uncertainties:")
-			for unc in vlm["uncertainties"]:
-				lines.append(f"- {unc}")
-		lines.append("")
-
-	# Rulebook excerpts
-	if result.get("rag_chunks"):
-		lines.append("--- Relevant Rulebook Excerpts ---")
-		for i, chunk in enumerate(result["rag_chunks"], start=1):
-			lines.append(f"[Excerpt {i} \u2014 {chunk.get('section_title', 'N/A')}]")
-			lines.append(chunk["text"])
-			lines.append("")
-
-	# JSON output schema
-	lines.append("Return JSON only:")
-	lines.append(json.dumps({
-		"question": "Was this player in blue uniform travelling?",
-		"applicable_rules": [
-			{"rule": "Rule 4, Section III(b)", "application": "How the gather rule applies to the visible facts."},
-			{"rule": "Rule 8, Section XIII(b)", "application": "How the two-step and pivot-foot rules apply to the visible facts."},
-		],
-		"likely_gather_frame": "F01|F02|F03|F04|F05|F06|F07|unclear",
-		"gather_confidence": "low|medium|high",
-		"post_gather_step_count_visible": "0|1|2|more_than_2|unclear",
-		"pivot_foot": "left|right|either|none|unclear",
-		"travel_ruling": "travel|no_travel|inconclusive",
-		"ruling_confidence": "low|medium|high",
-		"reasoning": "Short explanation focused on gather, steps, and pivot foot.",
-		"facts_required_for_travel_call": ["Specific missing or required fact."],
-		"limitations": ["Specific ambiguity caused by sampled frames, occlusion, or missing video."],
-	}, indent=2))
-
-	print("\n".join(lines))
+	print(build_reasoning_prompt(result.get("vlm_result"), result.get("rag_chunks")))
 	print(sep)
 
 	# ── Ruling ───────────────────────────────────────────────────────────
@@ -737,6 +1127,56 @@ def main() -> int:
 			print(f"  - {lim}")
 		print()
 		print(sep)
+	elif result.get("ruling_error"):
+		print()
+		print(sep)
+		print(" RULING")
+		print(sep)
+		print(f"  [FAILED] {result['ruling_error']}")
+		print()
+		print("  The copy-paste prompt above can be submitted manually to any OpenAI-compatible interface.")
+		print(sep)
+
+	# ── Status Report ────────────────────────────────────────────────────
+	status_rows: list[tuple[str, bool, str]] = []
+	rulebook_ok = bool(result.get("rulebook_embedding_store"))
+	status_rows.append(("Rulebook embeddings", rulebook_ok, "ready" if rulebook_ok else "missing"))
+
+	frames_ok = int(result.get("n_frames", 0)) > 0
+	status_rows.append(("Frame extraction", frames_ok, f"{result.get('n_frames', 0)} frames" if frames_ok else "no frames"))
+
+	if result.get("api_call_authorized", True):
+		status_rows.append(("Live API consent", True, "confirmed"))
+	else:
+		status_rows.append(("Live API consent", False, "declined"))
+
+	vlm_ok = result.get("vlm_result") is not None and not result.get("vlm_error")
+	status_rows.append(("VLM analysis", vlm_ok, "completed" if vlm_ok else str(result.get("vlm_error") or "failed")))
+
+	vlm_embedding_ok = result.get("vlm_embedding") is not None and not result.get("vlm_embedding_error")
+	status_rows.append(
+		(
+			"VLM embedding",
+			vlm_embedding_ok,
+			"completed" if vlm_embedding_ok else str(result.get("vlm_embedding_error") or "failed"),
+		)
+	)
+
+	rag_ok = result.get("rag_chunks") is not None and not result.get("rag_error")
+	status_rows.append(("Rule retrieval", rag_ok, "completed" if rag_ok else str(result.get("rag_error") or "failed")))
+
+	ruling_ok = result.get("ruling") is not None and not result.get("ruling_error")
+	status_rows.append(("Final ruling", ruling_ok, "completed" if ruling_ok else str(result.get("ruling_error") or "failed")))
+
+	print()
+	print(sep)
+	print(" STATUS REPORT")
+	print(sep)
+	for section, ok, detail in status_rows:
+		icon = "✅" if ok else "❌"
+		print(f"  {icon} {section}: {'successful' if ok else 'failure'}")
+		print(f"     {detail}")
+	print(sep)
 
 	return 0
 

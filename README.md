@@ -19,9 +19,9 @@ YouTube URL + start/end timestamps + question
               ↓
   6. FAISS retrieval      (top-5 rulebook chunks by semantic similarity)
               ↓
-  7. Ruling prompt        (structured prompt assembled for manual or automated reasoning)
+  7. Automated reasoning  (OpenAI-compatible endpoint → structured JSON ruling)
               ↓
-  Answer + verdict + applicable rules + reasoning + confidence + limitations
+  Verdict + applicable rules + reasoning + confidence + limitations
 ```
 
 ## Current scope
@@ -36,7 +36,7 @@ YouTube URL + start/end timestamps + question
 |---|---|---|
 | VLM narration | `VLM_MODEL` env var | Any OpenAI-compatible vision model |
 | Rulebook embeddings | `BAAI/bge-small-en-v1.5` (fixed) | Lightweight CPU sentence embeddings |
-| Ruling / reasoning | manual copy-paste or `REASONER_MODEL` env var | Structured JSON prompt generated automatically |
+| Ruling / reasoning | `REASONER_MODEL` env var | Automated via OpenAI-compatible endpoint; copy-paste prompt also printed as fallback |
 
 Both VLM and reasoning stages target `https://api.openai.com/v1/chat/completions` by default. Override with `VLM_API_BASE` / `REASONER_API_BASE` env vars.
 
@@ -49,9 +49,10 @@ Running `run_nba_query.py` produces clearly separated sections:
 | **Header** | URL, video ID, interval, question, frame count, output paths |
 | **Rulebook Embeddings** | Whether the index was built or already present, PDF path, chunk count |
 | **VLM Prompt** | Full prompt sent to the vision model |
-| **VLM Output** | Structured JSON narration returned by the VLM, plus embedding metadata |
-| **Copy-Paste Prompt** | Complete ready-to-paste prompt for OpenAI with system instruction, play description, rulebook excerpts, decision standard, required analysis, and JSON output schema |
-| **Ruling** *(demo mode)* | Formatted verdict, applicable rules, reasoning, required facts, and limitations |
+| **VLM Output** | Raw VLM model response first, then parsed structured JSON narration, plus embedding metadata |
+| **Copy-Paste Prompt** | Complete ready-to-paste prompt for manual review in ChatGPT or any OpenAI-compatible interface |
+| **Ruling** | Formatted verdict, applicable rules, reasoning, required facts, and limitations (automated in live mode; pre-computed in demo mode) |
+| **Status Report** | Final per-stage result summary with icons and `successful` or `failure` status labels |
 
 ## Project structure
 ```
@@ -71,6 +72,7 @@ scripts/
 data/
   vector_store/        # FAISS index + chunk metadata (built at runtime)
   processed/           # extracted frames and demo artifacts
+    demo_frames/       # pre-saved frames for --demo mode (no API calls needed)
 ```
 
 ## Setup
@@ -96,7 +98,7 @@ The rulebook index is built automatically on first run if not already present.
 
 ### Demo mode (no live API calls)
 
-Uses a built-in clip and pre-saved VLM output. No `VLM_MODEL` or API key needed.
+Uses a built-in clip with saved demo frames and a local mock VLM output. No API key or model config needed.
 
 ```bash
 python scripts/run_nba_query.py --demo
@@ -104,10 +106,9 @@ python scripts/run_nba_query.py --demo
 
 ### Live mode
 
-```bash
-export VLM_MODEL=gpt-4o
-export OPENAI_API_KEY=sk-...
+On the first live run, the CLI will interactively prompt for any missing credentials and model choices. You will not need to set environment variables manually unless you prefer to:
 
+```bash
 python scripts/run_nba_query.py \
   --youtube-url "https://www.youtube.com/watch?v=9fFWawcJXUw" \
   --start-time "0:21" \
@@ -115,7 +116,43 @@ python scripts/run_nba_query.py \
   --question "Was the player in the blue uniform traveling?"
 ```
 
-The **Copy-Paste Prompt** section at the end of the output contains the full structured prompt — paste it directly into ChatGPT or any OpenAI-compatible interface to get the JSON ruling.
+The CLI will prompt for:
+- **`OPENAI_API_KEY`** — entered via a hidden prompt (not echoed to terminal)
+- **`VLM_MODEL`** — selected from a numbered menu of known OpenAI models or a custom ID
+- **`REASONER_MODEL`** — same selection menu
+
+Before making any live VLM or reasoning API call, the CLI also shows a one-time warning that calls may charge your account and asks for confirmation:
+
+```text
+Warning: this run will call external LLM/VLM APIs using your API key and may charge your account.
+Continue with paid API calls? [y/N]:
+```
+
+If you answer `N` (or press Enter), paid API calls are skipped and the run still completes with failure status entries for those skipped stages in the final status report.
+
+Credentials are saved to a local `.env` file with permissions `600` (owner read/write only). The `.env` file is excluded from git via `.gitignore` and is **never committed to the repository**.
+
+On subsequent runs the saved `.env` is loaded automatically and no prompts appear.
+
+To set credentials manually instead:
+
+```bash
+export OPENAI_API_KEY=<your-key>
+export VLM_MODEL=gpt-4o
+export REASONER_MODEL=gpt-4o
+```
+
+Once configured, the pipeline runs fully automated: frames are extracted, the VLM narrates the play, the top-5 rulebook chunks are retrieved, and a structured **RULING** section is printed in the terminal.
+
+The **Copy-Paste Prompt** section is also always printed as a fallback for manual review in ChatGPT or any OpenAI-compatible interface.
+
+### Output directory behavior
+
+- **Default output root**: `data/processed`
+- **Demo mode** (`--demo`): uses `data/processed/demo_frames`
+- **Live mode** (non-demo): writes run artifacts into a timestamped subdirectory under the output root, e.g. `data/processed/20260426_153045`
+
+This keeps live runs isolated from each other while preserving stable demo assets.
 
 ### CLI reference
 
@@ -127,7 +164,7 @@ The **Copy-Paste Prompt** section at the end of the output contains the full str
 --n-frames             Target keyframe count (clamped to 5–10, default 8)
 --output-dir           Where to save frames and grid preview
 --no-show              Skip interactive matplotlib display
---demo                 Use built-in clip + saved VLM output, no API calls
+--demo                 Use built-in clip + local mock VLM output, no API calls
 --rulebook-pdf-path    Path to NBA rulebook PDF (auto-used if index missing)
 --vector-store-dir     FAISS index directory (default: data/vector_store)
 ```
@@ -136,11 +173,23 @@ The **Copy-Paste Prompt** section at the end of the output contains the full str
 
 | Variable | Default | Description |
 |---|---|---|
-| `VLM_MODEL` | *(required for live mode)* | Vision model ID |
-| `OPENAI_API_KEY` | *(required for live mode)* | API key |
+| `OPENAI_API_KEY` | *(prompted on first live run)* | API key — saved to `.env` (mode 600), never printed |
+| `VLM_MODEL` | *(prompted on first live run)* | Vision model ID |
+| `REASONER_MODEL` | *(prompted on first live run)* | Reasoning model ID; falls back to `VLM_MODEL` if unset |
 | `VLM_API_BASE` | `https://api.openai.com/v1/chat/completions` | Override VLM endpoint |
 | `REASONER_API_BASE` | `https://api.openai.com/v1/chat/completions` | Override reasoning endpoint |
+| `VLM_REASONING_EFFORT` | `none` | Reasoning effort value passed to VLM API payload |
+| `VLM_MAX_COMPLETION_TOKENS` | `2048` | Completion token cap for VLM API payload |
+| `HF_TOKEN` | *(unset)* | Optional fallback token for non-OpenAI-compatible endpoints |
 | `EMBEDDING_DEVICE` | `cpu` | Set to `cuda` to use GPU for embeddings |
+
+## Credential security
+
+- **`.env` is in `.gitignore`** and is never tracked or committed.
+- The API key is entered via a hidden prompt (`getpass`) — it is never echoed to the terminal or printed anywhere.
+- The `.env` file is written with `chmod 600` (owner read/write only).
+- No credentials appear in any source file, notebook output, or test fixture.
+- To rotate or remove saved credentials, delete or edit `.env` at the repo root.
 
 ## Tests
 
@@ -149,6 +198,12 @@ pytest tests/ -m "not integration"
 ```
 
 Integration tests (marked `@pytest.mark.integration`) require `yt-dlp` and network access.
+
+Real paid API tests are marked `@pytest.mark.api` and are skipped by default. Run them only with explicit opt-in:
+
+```bash
+pytest --run-api-tests tests/test_run_nba_query.py::test_api_calls_work -s -v
+```
 
 ## Progress
 
@@ -161,14 +216,18 @@ Integration tests (marked `@pytest.mark.integration`) require `yt-dlp` and netwo
 - [x] Query builder combining VLM output + question for retrieval
 - [x] Top-5 FAISS retrieval with section titles and similarity scores
 - [x] Structured copy-paste ruling prompt (decision standard, JSON schema, rulebook excerpts)
-- [x] Demo mode with pre-saved clip, VLM output, and ChatGPT ruling
-- [x] Demo mode loads saved frames from data/processed/demo_frames
+- [x] Demo mode with pre-saved clip and VLM output (no API calls)
+- [x] Demo mode loads saved frames from `data/processed/demo_frames/`
 - [x] Clearly separated terminal output for each pipeline stage
+- [x] Automated reasoning via OpenAI-compatible endpoint (live mode)
+- [x] Secure credential bootstrap: interactive prompts, `getpass`, `.env` + `chmod 600`
+- [x] Model selection menu (numbered list of known OpenAI models + custom entry)
 - [x] Cleanup pass: removed deprecated scripts/modules and stale tests
-- [ ] Automated reasoning step wired into CLI (currently copy-paste to OpenAI)
-- [ ] Broader rule coverage beyond travelling (fouls, out-of-bounds, etc.)
 - [ ] Colab notebook polish and end-to-end reproducibility improvements
 - [ ] Demo UI (Gradio or Streamlit)
+
+## Future work
+- [ ] Broader rule coverage beyond travelling (fouls, out-of-bounds, etc.)
 
 ## License
 MIT. See `LICENSE`.

@@ -4,6 +4,10 @@
 
 A multimodal RAG system that watches a short basketball clip, narrates it with a vision model, retrieves relevant NBA rulebook sections, and produces a structured officiating analysis with explicit rule citations and confidence levels.
 
+<p align="center">
+  <img src="docs/cover.gif" alt="NBA Video Rules RAG Cover">
+</p>
+
 ## Try it in Colab
 
 The fastest way to run the full pipeline is the interactive Colab notebook — no local setup required:
